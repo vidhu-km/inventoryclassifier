@@ -480,13 +480,16 @@ if enable_classification and classification_ready:
     # Build field-level data: average per section from Sheet 1 wells
     field_wells = proximal_wells.copy()
 
-    # Assign each well to a section via spatial join
-    well_midpoints = field_wells[field_wells["_midpoint"].notna()].copy()
-    well_midpoints = well_midpoints.set_geometry(
-        gpd.GeoSeries(well_midpoints["_midpoint"], crs=field_wells.crs)
+    # Compute endpoints for all wells
+    field_wells["_endpoint"] = field_wells.geometry.apply(endpoint_of_geom)
+
+    well_endpoints = field_wells[field_wells["_endpoint"].notna()].copy()
+    well_endpoints = well_endpoints.set_geometry(
+        gpd.GeoSeries(well_endpoints["_endpoint"], crs=field_wells.crs)
     )
+
     well_sec_join = gpd.sjoin(
-        well_midpoints,
+        well_endpoints,
         section_enriched[["Section", "geometry"]],
         how="left", predicate="within",
     )
