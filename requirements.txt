@@ -12,3 +12,4 @@ pydeck
 matplotlib
 plotly
 scikit-learn
+thefuzz
