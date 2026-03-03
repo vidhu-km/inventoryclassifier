@@ -477,23 +477,6 @@ if enable_classification and classification_ready:
     ip90_col_name = cls_cols_chosen["IP90"]
     y1_col_name = cls_cols_chosen["1Y"]
 
-    # Build field-level data: average per section from Sheet 1 wells
-    field_wells = proximal_wells.copy()
-
-    # Compute endpoints for all wells
-    field_wells["_endpoint"] = field_wells.geometry.apply(endpoint_of_geom)
-
-    well_endpoints = field_wells[field_wells["_endpoint"].notna()].copy()
-    well_endpoints = well_endpoints.set_geometry(
-        gpd.GeoSeries(well_endpoints["_endpoint"], crs=field_wells.crs)
-    )
-
-    well_sec_join = gpd.sjoin(
-        well_endpoints,
-        section_enriched[["Section", "geometry"]],
-        how="left", predicate="within",
-    )
-
     field_section_avg = (
     proximal_wells
     .dropna(subset=["Section"])
