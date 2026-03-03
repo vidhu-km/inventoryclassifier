@@ -117,9 +117,9 @@ def load_data():
     lines = gpd.read_file("lines.shp")
     points = gpd.read_file("points.shp")
     grid = gpd.read_file("ooipsectiongrid.shp")
-    infills = gpd.read_file("2M_Infills_plyln.shp")
+    infills = gpd.read_file("Infills_plyln.shp")
     merged = gpd.read_file("merged_inventory.shp")
-    lease_lines = gpd.read_file("2M_LL_plyln.shp")
+    lease_lines = gpd.read_file("LL_plyln.shp")
     units = gpd.read_file("Bakken Units.shp")
     land = gpd.read_file("Bakken Land.shp")
 
@@ -494,11 +494,13 @@ if enable_classification and classification_ready:
         how="left", predicate="within",
     )
 
-    # Average well-level metrics per section
-    field_section_avg = well_sec_join.groupby("Section").agg({
-        col: "mean" for col in [ooip_col_name, eur_col_name, ip90_col_name, y1_col_name]
-        if col in well_sec_join.columns
-    }).dropna()
+    field_section_avg = (
+    proximal_wells
+    .dropna(subset=["Section"])
+    .groupby("Section")
+    [[ooip_col_name, eur_col_name, ip90_col_name, y1_col_name]]
+    .mean()
+    )
 
     # Also pull section-level OOIP if it's a Sheet 2 column
     if ooip_col_name in section_df.columns:
