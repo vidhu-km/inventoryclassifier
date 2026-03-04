@@ -107,11 +107,11 @@ def classify_label(z, threshold):
 
 
 def prospect_coords_latlon(geom, transformer):
-    """Return (midpoint_lat, midpoint_lon) for a prospect geometry in 4326."""
-    mid = midpoint_of_geom(geom)
-    if mid is None:
+    """Return (endpoint_lat, endpoint_lon) for a prospect geometry in 4326."""
+    ep = endpoint_of_geom(geom)
+    if ep is None:
         return np.nan, np.nan
-    lon, lat = transformer.transform(mid.x, mid.y)
+    lon, lat = transformer.transform(ep.x, ep.y)
     return round(lat, 6), round(lon, 6)
 
 
