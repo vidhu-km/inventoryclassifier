@@ -39,7 +39,6 @@ SECTION_OOIP_COL = "SectionOOIP"
 # ==========================================================
 
 
-
 def safe_range(series):
     vals = series.replace([np.inf, -np.inf], np.nan).dropna()
     if vals.empty:
@@ -107,6 +106,15 @@ def classify_label(z, threshold):
     return "On Trend"
 
 
+def prospect_coords_latlon(geom, transformer):
+    """Return (midpoint_lat, midpoint_lon) for a prospect geometry in 4326."""
+    mid = midpoint_of_geom(geom)
+    if mid is None:
+        return np.nan, np.nan
+    lon, lat = transformer.transform(mid.x, mid.y)
+    return round(lat, 6), round(lon, 6)
+
+
 # ==========================================================
 # Load data
 # ==========================================================
@@ -122,7 +130,7 @@ def load_data():
     units = gpd.read_file("Bakken Units.shp")
     land = gpd.read_file("Bakken Land.shp")
 
-    # Sheet 0: must have UWI, Section, Norm EUR, Norm 1Y Cuml, Norm IP90
+    # Sheet 0: must have UWI, Section, Norm EUR, Norm 1Y Cuml, Norm IP90, WF
     well_df = pd.read_excel("wells.xlsx", sheet_name=0)
     # Sheet 1: must have Section, SectionOOIP
     section_df = pd.read_excel("wells.xlsx", sheet_name=1)
@@ -135,17 +143,22 @@ def load_data():
     grid["Section"] = grid["Section"].astype(str).str.strip()
     grid["geometry"] = grid.geometry.simplify(50, preserve_topology=True)
 
-    # Clean well data — keep only what we need
+    # Clean well data
     well_df["UWI"] = well_df["UWI"].astype(str).str.strip()
     well_df["Section"] = well_df["Section"].astype(str).str.strip()
     for col in WELL_COLS:
         well_df[col] = pd.to_numeric(well_df[col], errors="coerce")
 
+    # Ensure WF column exists and is numeric
+    if "WF" in well_df.columns:
+        well_df["WF"] = pd.to_numeric(well_df["WF"], errors="coerce")
+    else:
+        well_df["WF"] = np.nan
+
     # Clean section data
     section_df["Section"] = section_df["Section"].astype(str).str.strip()
     section_df[SECTION_OOIP_COL] = pd.to_numeric(section_df[SECTION_OOIP_COL], errors="coerce")
 
-    # Also keep any other numeric columns in section_df for the grid gradient selector
     sec_numeric_cols = [
         c for c in section_df.columns
         if c != "Section" and pd.api.types.is_numeric_dtype(section_df[c])
@@ -166,8 +179,8 @@ def load_data():
 (lines_gdf, points_gdf, grid_gdf, units_gdf, infills_gdf, lease_lines_gdf,
  merged_gdf, land_gdf, well_df, section_df, SEC_NUMERIC_COLS) = load_data()
 
-# All metric columns available on prospects (IDW cols + section OOIP)
-ALL_METRIC_COLS = WELL_COLS + [SECTION_OOIP_COL]
+# All metric columns available on prospects (IDW cols + WF + section OOIP)
+ALL_METRIC_COLS = WELL_COLS + ["WF", SECTION_OOIP_COL]
 
 # ==========================================================
 # Derived spatial data
@@ -227,7 +240,8 @@ prospects = gpd.GeoDataFrame(
 )
 
 # ==========================================================
-# Analyse prospects — IDW² for well-level cols, mean for SectionOOIP
+# Analyse prospects — IDW² for well-level cols, geometry-intersect for WF,
+#                      mean for SectionOOIP
 # ==========================================================
 
 def analyze_prospects(pros, prox, sections, buffer_m):
@@ -257,7 +271,7 @@ def analyze_prospects(pros, prox, sections, buffer_m):
         {"_pidx": pros.index, "geometry": pros["_buffer"]}, crs=pros.crs,
     )
 
-    # --- IDW² for well-level metrics ---
+    # --- IDW² for well-level metrics (midpoint-based) ---
     midpt_gdf = prox[prox["_midpoint"].notna()].copy()
     midpt_gdf = midpt_gdf.set_geometry(
         gpd.GeoSeries(midpt_gdf["_midpoint"], crs=prox.crs)
@@ -288,6 +302,37 @@ def analyze_prospects(pros, prox, sections, buffer_m):
         .reindex(pros.index, fill_value="")
     )
 
+    # --- WF: geometry-intersect based (any part of well in buffer) ---
+    # Use the original well geometries (lines/points), not midpoints
+    wf_wells = prox[["UWI", "WF", "geometry"]].copy()
+    wf_wells = wf_wells[wf_wells["WF"].notna()].copy()
+
+    if not wf_wells.empty:
+        # Spatial join using actual well geometry intersecting the buffer
+        wf_hits = gpd.sjoin(wf_wells, buffer_gdf, how="inner", predicate="intersects")
+        # For each prospect buffer, compute IDW² of WF using midpoints of
+        # the intersecting wells for distance calculation
+        wf_hits["_well_midpoint"] = wf_hits.geometry.apply(midpoint_of_geom)
+        wf_px_pts = wf_hits["index_right"].map(lambda i: pros.at[i, "_midpoint"])
+        wf_hits["_dist"] = np.sqrt(
+            (wf_hits["_well_midpoint"].apply(lambda pt: pt.x if pt else np.nan) -
+             wf_px_pts.apply(lambda pt: pt.x if pt else np.nan)) ** 2 +
+            (wf_hits["_well_midpoint"].apply(lambda pt: pt.y if pt else np.nan) -
+             wf_px_pts.apply(lambda pt: pt.y if pt else np.nan)) ** 2
+        ).replace(0, 1.0)
+        wf_hits["_w"] = 1.0 / (wf_hits["_dist"] ** 2)
+        wf_valid = wf_hits[wf_hits["WF"].notna() & wf_hits["_w"].notna()].copy()
+        if not wf_valid.empty:
+            wf_valid["_wv"] = wf_valid["WF"] * wf_valid["_w"]
+            wf_g = wf_valid.groupby("index_right").agg(
+                _wv_sum=("_wv", "sum"), _w_sum=("_w", "sum")
+            )
+            wf_idw = (wf_g["_wv_sum"] / wf_g["_w_sum"]).reindex(pros.index)
+        else:
+            wf_idw = pd.Series(np.nan, index=pros.index)
+    else:
+        wf_idw = pd.Series(np.nan, index=pros.index)
+
     # --- Mean SectionOOIP from intersecting grid cells ---
     sec_join = gpd.sjoin(
         sections[["geometry", SECTION_OOIP_COL]], buffer_gdf,
@@ -303,6 +348,7 @@ def analyze_prospects(pros, prox, sections, buffer_m):
     out["_proximal_uwis"] = proximal_uwis.values
     for col in WELL_COLS:
         out[col] = idw_results[col].values
+    out["WF"] = wf_idw.values
     out[SECTION_OOIP_COL] = ooip_mean.values
 
     return out
@@ -319,6 +365,14 @@ prospects["Label"] = prospects["_section_label"]
 for col in ALL_METRIC_COLS:
     if col in prospects.columns:
         prospects[col] = prospects[col].replace([np.inf, -np.inf], np.nan)
+
+# ==========================================================
+# Compute prospect coordinates (lat/lon of midpoint)
+# ==========================================================
+_transformer_coord = Transformer.from_crs("EPSG:26913", "EPSG:4326", always_xy=True)
+_coords = prospects.geometry.apply(lambda g: prospect_coords_latlon(g, _transformer_coord))
+prospects["Latitude"] = _coords.apply(lambda x: x[0])
+prospects["Longitude"] = _coords.apply(lambda x: x[1])
 
 # ==========================================================
 # Classification
@@ -559,7 +613,7 @@ p_lines_display = p_lines.to_crs(4326)
 # ==========================================================
 rank_df = None
 if not (selected_metric == "High-Grade Score" and total_weight != 100):
-    display_cols = ["Label", "_prospect_type", "Proximal_Count"]
+    display_cols = ["Label", "_prospect_type", "Latitude", "Longitude", "Proximal_Count"]
     display_cols += [c for c in ALL_METRIC_COLS if c in p.columns]
     if selected_metric == "High-Grade Score" and "HighGradeScore" in p.columns:
         display_cols.append("HighGradeScore")
@@ -639,7 +693,7 @@ if section_gradient != "None" and section_gradient in section_display.columns:
 else:
     sec_style = lambda _: NULL_STYLE
 
-# Section tooltip — show everything available
+# Section tooltip
 sec_tip_fields = [c for c in section_display.columns if c != "geometry"]
 section_fg = folium.FeatureGroup(name="Section Grid", show=(section_gradient != "None"))
 folium.GeoJson(
@@ -665,7 +719,6 @@ folium.FeatureGroup(name="Units", show=True).add_child(
 buffer_fg = folium.FeatureGroup(name="Prospect Buffers")
 for _, brow in buffer_gdf[buffer_gdf["_passes_filter"]].iterrows():
     fc = label_color_map.get(brow["Label"], "#cccccc")
-    # Tooltip — show everything
     tip_parts = [f"<b>{brow['Label']}</b>", f"Proximal Wells: {brow.get('Proximal_Count', '—')}"]
     for col in ALL_METRIC_COLS:
         if col in brow.index and pd.notna(brow[col]):
@@ -709,7 +762,6 @@ well_fg = folium.FeatureGroup(name="Existing Wells")
 line_wells = existing_display[existing_display.geometry.type != "Point"]
 point_wells = existing_display[existing_display.geometry.type == "Point"]
 
-# Well tooltip — show everything
 well_tip_fields = [c for c in existing_display.columns if c not in ("geometry", "_midpoint")]
 
 if not line_wells.empty:
@@ -724,11 +776,8 @@ if not line_wells.empty:
                   "border:1px solid #333;border-radius:3px;",
         ),
     ).add_to(well_fg)
-    
-    # Drop non-JSON-serializable columns before exporting
-    line_wells_clean = line_wells.drop(columns=["_midpoint"], errors="ignore").copy()
 
-    # Convert any remaining object columns to string (safe fallback)
+    line_wells_clean = line_wells.drop(columns=["_midpoint"], errors="ignore").copy()
     for c in line_wells_clean.columns:
         if c != "geometry" and line_wells_clean[c].dtype == object:
             line_wells_clean[c] = line_wells_clean[c].astype(str)
@@ -777,7 +826,6 @@ if has_classification:
         cls_val = row.get("Classification", None)
         line_color = COLOR_MAP_CLASS.get(cls_val, "red") if pd.notna(cls_val) else "red"
 
-        # Tooltip — everything
         tip_parts = [
             f"<b>{c}:</b> {row[c]}"
             for c in p_lines_display.columns if c != "geometry"
@@ -837,7 +885,6 @@ if classification_ready and "Classification" in p.columns:
         x_range = np.linspace(field[SECTION_OOIP_COL].min(), field[SECTION_OOIP_COL].max(), 100)
 
         with col1:
-            # EUR vs SectionOOIP
             fig_eur = px.scatter(
                 pros_chart, x=SECTION_OOIP_COL, y="Norm EUR",
                 color="Classification", color_discrete_map=COLOR_MAP_CLASS,
@@ -854,7 +901,6 @@ if classification_ready and "Classification" in p.columns:
             ))
             st.plotly_chart(fig_eur, use_container_width=True)
 
-            # IP90 vs SectionOOIP
             fig_ip90 = px.scatter(
                 pros_chart, x=SECTION_OOIP_COL, y="Norm IP90",
                 color="Classification", color_discrete_map=COLOR_MAP_CLASS,
@@ -872,7 +918,6 @@ if classification_ready and "Classification" in p.columns:
             st.plotly_chart(fig_ip90, use_container_width=True)
 
         with col2:
-            # 1Y Cuml vs SectionOOIP
             fig_1y = px.scatter(
                 pros_chart, x=SECTION_OOIP_COL, y="Norm 1Y Cuml",
                 color="Classification", color_discrete_map=COLOR_MAP_CLASS,
@@ -889,7 +934,6 @@ if classification_ready and "Classification" in p.columns:
             ))
             st.plotly_chart(fig_1y, use_container_width=True)
 
-            # Composite Z
             fig_comp = px.scatter(
                 pros_chart, x=SECTION_OOIP_COL, y="Composite_Z",
                 color="Classification", color_discrete_map=COLOR_MAP_CLASS,
@@ -908,9 +952,10 @@ if classification_ready and "Classification" in p.columns:
         summary.columns = ["Classification", "Count"]
         st.dataframe(summary, use_container_width=True)
 
-        # Detailed table
+        # Detailed table — now with coordinates
         cls_display = pros_chart[[
-            "Label", SECTION_OOIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90",
+            "Label", "Latitude", "Longitude",
+            SECTION_OOIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90", "WF",
             "Z_EUR", "Z_IP90", "Z_1Y", "Composite_Z", "Classification"
         ]].copy()
         cls_display = cls_display.sort_values("Composite_Z", ascending=False).reset_index(drop=True)
@@ -946,6 +991,8 @@ else:
             fmt[c] = "{:.0f}%"
         elif c == "Proximal":
             fmt[c] = "{:.0f}"
+        elif c in ("Latitude", "Longitude"):
+            fmt[c] = "{:.6f}"
         elif rank_df[c].dtype in [np.float64, np.float32, float]:
             fmt[c] = (
                 "{:,.0f}"
@@ -982,10 +1029,13 @@ else:
             cols = st.columns(4)
             for ci, mc in enumerate(detail_metrics[row_start:row_start + 4]):
                 val = dr.get(mc, np.nan)
-                display_val = (
-                    f"{val:,.0f}" if pd.notna(val) and abs(val) > 100
-                    else (f"{val:.3f}" if pd.notna(val) else "—")
-                )
+                if mc in ("Latitude", "Longitude"):
+                    display_val = f"{val:.6f}" if pd.notna(val) else "—"
+                else:
+                    display_val = (
+                        f"{val:,.0f}" if pd.notna(val) and abs(val) > 100
+                        else (f"{val:.3f}" if pd.notna(val) else "—")
+                    )
                 cols[ci].metric(mc, display_val)
 
         if "Classification" in dr.index and pd.notna(dr["Classification"]):
@@ -1003,6 +1053,8 @@ if not no_prox.empty:
     st.subheader("⚠️ No Proximal Wells Found")
     st.caption(f"{len(no_prox)} prospects have no proximal wells within {buffer_distance}m.")
     st.dataframe(
-        no_prox[["Label", "_prospect_type"]].rename(columns={"_prospect_type": "Type"}).reset_index(drop=True),
+        no_prox[["Label", "_prospect_type", "Latitude", "Longitude"]].rename(
+            columns={"_prospect_type": "Type"}
+        ).reset_index(drop=True),
         use_container_width=True,
     )
