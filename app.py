@@ -17,7 +17,7 @@ from sklearn.linear_model import LinearRegression
 # ==========================================================
 # Page configuration
 # ==========================================================
-st.set_page_config(layout="wide", page_title="Bakken Inventory Engine", page_icon="🛢️")
+st.set_page_config(layout="wide", page_title="Bakken Inventory Optimizer", page_icon="🛢️")
 
 # ==========================================================
 # Constants
@@ -635,7 +635,7 @@ if not (selected_metric == "High-Grade Score" and total_weight != 100):
 # ==========================================================
 # Executive summary
 # ==========================================================
-st.title("🛢️ Bakken Inventory Engine")
+st.title("Bakken Inventory Optimizer 🛢️")
 
 if n_passing > 0:
     best_pool = p[p["_passes_filter"]].dropna(subset=[metric_col])
