@@ -792,7 +792,7 @@ if not line_wells.empty:
         if ep is not None:
             folium.CircleMarker(
                 location=[ep.y, ep.x], radius=1,
-                color="black", fill=True, fill_color="black", fill_opacity=0.9, weight=0.5,
+                color="black", fill=True, fill_color="black", fill_opacity=0.8, weight=1,
             ).add_to(well_fg)
 
 for _, row in point_wells.iterrows():
