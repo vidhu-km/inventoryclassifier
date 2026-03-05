@@ -137,9 +137,9 @@ def load_data():
     lines = gpd.read_file("lines.shp")
     points = gpd.read_file("points.shp")
     grid = gpd.read_file("ooipsectiongrid.shp")
-    infills = gpd.read_file("Infills_plyln.shp")
+    infills = gpd.read_file("inf.shp")
     merged = gpd.read_file("merged_inventory.shp")
-    lease_lines = gpd.read_file("LL_plyln.shp")
+    lease_lines = gpd.read_file("ll.shp")
     units = gpd.read_file("Bakken Units.shp")
     land = gpd.read_file("Bakken Land.shp")
 
