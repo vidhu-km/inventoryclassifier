@@ -12,7 +12,7 @@ import matplotlib.colors as mcolors
 import matplotlib.cm as mpl_cm
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, RANSACRegressor
 
 # ==========================================================
 # Page configuration
@@ -92,10 +92,23 @@ def get_ylgn_hex(value, vmin, vmax):
 
 def fit_trend(x, y):
     mask = np.isfinite(x) & np.isfinite(y)
-    if mask.sum() < 2:
+    if mask.sum() < 3:
         return None
-    model = LinearRegression().fit(x[mask].values.reshape(-1, 1), y[mask].values)
-    return model
+
+    X = x[mask].values.reshape(-1, 1)
+    Y = y[mask].values
+
+    try:
+        model = RANSACRegressor(
+            estimator=LinearRegression(),
+            min_samples=max(3, int(0.5 * len(X))),
+            residual_threshold=None,
+            random_state=42
+        )
+        model.fit(X, Y)
+        return model
+    except Exception:
+        return None
 
 
 def classify_label(z, threshold):
