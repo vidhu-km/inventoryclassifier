@@ -372,9 +372,9 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("📐 Classification Settings")
 
 st.sidebar.markdown("**Productivity weights (must sum to 100):**")
-cw_eur = st.sidebar.number_input("EUR weight %", 0, 100, 50, key="cw_eur")
-cw_1y = st.sidebar.number_input("1Y weight %", 0, 100, 25, key="cw_1y")
-cw_ip90 = st.sidebar.number_input("IP90 weight %", 0, 100, 25, key="cw_ip90")
+cw_eur = st.sidebar.number_input("EUR weight %", 0, 100, 34, key="cw_eur")
+cw_1y = st.sidebar.number_input("1Y weight %", 0, 100, 33, key="cw_1y")
+cw_ip90 = st.sidebar.number_input("IP90 weight %", 0, 100, 33, key="cw_ip90")
 cw_sum = cw_eur + cw_1y + cw_ip90
 
 classification_ready = False
