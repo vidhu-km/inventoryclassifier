@@ -21,7 +21,15 @@ st.set_page_config(layout="wide", page_title="Bakken Inventory Optimizer", page_
 
 NULL_STYLE = {"fillColor": "#ffffff", "fillOpacity": 0, "color": "#888", "weight": 0.25}
 DEFAULT_BUFFER_M = 800
-COLOR_MAP_CLASS = {"Above Trend": "#2ca02c", "On Trend": "#1f77b4", "Below Trend": "#d62728"}
+
+# ---- 4-quadrant colour scheme ----
+COLOR_MAP_CLASS = {
+    "High Prod / High Resource": "#2ca02c",   # green  — best
+    "Low Prod / High Resource":  "#ff7f0e",   # orange — resource-rich but underperforming
+    "High Prod / Low Resource":  "#1f77b4",   # blue   — efficient in lean rock
+    "Low Prod / Low Resource":   "#d62728",   # red    — weakest
+}
+
 WELL_COLS = ["Norm EUR", "Norm 1Y Cuml", "Norm IP90"]
 SECTION_OOIP_COL = "SectionOOIP"
 ALL_METRIC_COLS = WELL_COLS + ["WF", SECTION_OOIP_COL]
@@ -99,10 +107,34 @@ def fit_trend(x, y):
         return None
 
 
-def classify_label(z, threshold):
-    if z > threshold:
-        return "Above Trend"
-    return "Below Trend" if z < -threshold else "On Trend"
+def classify_quadrant(prod_z, resource_z, prod_thresh, resource_thresh):
+    """Classify a prospect into one of four quadrants.
+
+    Parameters
+    ----------
+    prod_z : float
+        Composite productivity Z-score (residual from OOIP→production trends).
+    resource_z : float
+        Resource Z-score (SectionOOIP relative to field distribution).
+    prod_thresh : float
+        Sigma threshold for high/low productivity.
+    resource_thresh : float
+        Sigma threshold for high/low resource.
+
+    Returns
+    -------
+    str
+        One of the four quadrant labels.
+    """
+    high_prod = prod_z >= prod_thresh
+    high_resource = resource_z >= resource_thresh
+    if high_prod and high_resource:
+        return "High Prod / High Resource"
+    if (not high_prod) and high_resource:
+        return "Low Prod / High Resource"
+    if high_prod and (not high_resource):
+        return "High Prod / Low Resource"
+    return "Low Prod / Low Resource"
 
 
 def prospect_coords_latlon(geom, transformer):
@@ -339,21 +371,33 @@ prospects["Longitude"] = _coords.apply(lambda x: x[1])
 st.sidebar.markdown("---")
 st.sidebar.subheader("📐 Classification Settings")
 
-st.sidebar.markdown("**Classification weights (must sum to 100):**")
+st.sidebar.markdown("**Productivity weights (must sum to 100):**")
 cw_eur = st.sidebar.number_input("EUR weight %", 0, 100, 50, key="cw_eur")
 cw_1y = st.sidebar.number_input("1Y weight %", 0, 100, 25, key="cw_1y")
 cw_ip90 = st.sidebar.number_input("IP90 weight %", 0, 100, 25, key="cw_ip90")
 cw_sum = cw_eur + cw_1y + cw_ip90
 
 classification_ready = False
-eur_model = ip90_model = y1_model = cls_threshold = None
+eur_model = ip90_model = y1_model = None
+prod_threshold = resource_threshold = None
 field = pd.DataFrame()
 
 if cw_sum != 100:
     st.sidebar.error(f"Weights sum to {cw_sum}%, must be 100%")
 else:
     st.sidebar.success(f"Weights: EUR {cw_eur}%, 1Y {cw_1y}%, IP90 {cw_ip90}%")
-    cls_threshold = st.sidebar.slider("Composite Z threshold (σ)", 0.1, 2.0, 0.5, 0.05, key="cls_thresh")
+
+    st.sidebar.markdown("**Quadrant thresholds:**")
+    prod_threshold = st.sidebar.slider(
+        "Productivity Z threshold (σ)", -1.0, 2.0, 0.0, 0.05,
+        help="Prospects above this composite-Z are 'High Prod'",
+        key="prod_thresh",
+    )
+    resource_threshold = st.sidebar.slider(
+        "Resource Z threshold (σ)", -1.0, 2.0, 0.0, 0.05,
+        help="Prospects above this OOIP-Z are 'High Resource'",
+        key="res_thresh",
+    )
 
     field = well_df.dropna(subset=[SECTION_OOIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90"]).copy()
     field = field[field[SECTION_OOIP_COL] > 0].copy()
@@ -372,6 +416,10 @@ else:
                 field[f"{tag}_resid"] = field[src] - model.predict(field[SECTION_OOIP_COL].values.reshape(-1, 1))
                 resid_std[tag] = field[f"{tag}_resid"].std()
 
+            # Field-level OOIP stats for resource Z-score
+            field_ooip_mean = field[SECTION_OOIP_COL].mean()
+            field_ooip_std = field[SECTION_OOIP_COL].std()
+
             pros_cls = prospects.dropna(subset=[SECTION_OOIP_COL] + WELL_COLS).copy()
             pros_cls = pros_cls[pros_cls[SECTION_OOIP_COL] > 0].copy()
 
@@ -384,21 +432,35 @@ else:
                 for tag, src, std in [("Z_EUR", "Norm EUR", resid_std["EUR"]),
                                        ("Z_IP90", "Norm IP90", resid_std["IP90"]),
                                        ("Z_1Y", "Norm 1Y Cuml", resid_std["Y1"])]:
-                    pred_col = f"{tag.split('_')[1]}_pred" if "_" in tag else f"{tag[2:]}_pred"
-                    # Map tag -> pred column
                     pred_map = {"Z_EUR": "EUR_pred", "Z_IP90": "IP90_pred", "Z_1Y": "Y1_pred"}
                     pros_cls[tag] = (pros_cls[src] - pros_cls[pred_map[tag]]) / std if std > 0 else 0
 
-                pros_cls["Composite_Z"] = (
+                # Productivity axis: weighted composite Z of trend residuals
+                pros_cls["Productivity_Z"] = (
                     (cw_eur / 100) * pros_cls["Z_EUR"] +
                     (cw_1y / 100) * pros_cls["Z_1Y"] +
                     (cw_ip90 / 100) * pros_cls["Z_IP90"]
                 )
-                pros_cls["Classification"] = pros_cls["Composite_Z"].apply(
-                    lambda z: classify_label(z, cls_threshold)
+
+                # Resource axis: OOIP Z-score relative to the field
+                if field_ooip_std > 0:
+                    pros_cls["Resource_Z"] = (
+                        (pros_cls[SECTION_OOIP_COL] - field_ooip_mean) / field_ooip_std
+                    )
+                else:
+                    pros_cls["Resource_Z"] = 0.0
+
+                # 4-quadrant classification
+                pros_cls["Classification"] = pros_cls.apply(
+                    lambda r: classify_quadrant(
+                        r["Productivity_Z"], r["Resource_Z"],
+                        prod_threshold, resource_threshold,
+                    ),
+                    axis=1,
                 )
 
-                for col in ["Classification", "Composite_Z", "Z_EUR", "Z_IP90", "Z_1Y"]:
+                for col in ["Classification", "Productivity_Z", "Resource_Z",
+                             "Z_EUR", "Z_IP90", "Z_1Y"]:
                     prospects[col] = np.nan
                     prospects.loc[pros_cls.index, col] = pros_cls[col]
 
@@ -804,7 +866,7 @@ st_folium(m, use_container_width=True, height=900, returned_objects=[])
 # ==========================================================
 if classification_ready and "Classification" in p.columns:
     st.markdown("---")
-    st.header("📐 Classification Results")
+    st.header("📐 Classification Results — 4-Quadrant View")
 
     pros_chart = p[p["_passes_filter"] & p["Classification"].notna()].copy()
 
@@ -836,27 +898,68 @@ if classification_ready and "Classification" in p.columns:
                 ))
                 st.plotly_chart(fig, use_container_width=True)
 
+        # ---- Productivity vs Resource quadrant chart ----
         with col2:
-            fig_comp = px.scatter(
-                pros_chart, x=SECTION_OOIP_COL, y="Composite_Z",
+            fig_quad = px.scatter(
+                pros_chart, x="Resource_Z", y="Productivity_Z",
                 color="Classification", color_discrete_map=COLOR_MAP_CLASS,
-                hover_data=["Label"], title="Composite Z-Score",
+                hover_data=["Label"],
+                title="Productivity Z vs Resource Z (4-Quadrant)",
+                labels={"Resource_Z": "Resource Z (SectionOOIP)", "Productivity_Z": "Productivity Z (Composite)"},
             )
-            fig_comp.add_hline(y=cls_threshold, line_dash="dot", line_color="green", annotation_text="Above Trend")
-            fig_comp.add_hline(y=-cls_threshold, line_dash="dot", line_color="red", annotation_text="Below Trend")
-            fig_comp.add_hline(y=0, line_dash="dash", line_color="black")
-            st.plotly_chart(fig_comp, use_container_width=True)
 
+            # Axis ranges for shaded rectangles
+            rx_min = min(pros_chart["Resource_Z"].min(), -2) - 0.5
+            rx_max = max(pros_chart["Resource_Z"].max(), 2) + 0.5
+            ry_min = min(pros_chart["Productivity_Z"].min(), -2) - 0.5
+            ry_max = max(pros_chart["Productivity_Z"].max(), 2) + 0.5
+
+            # Quadrant shading
+            quad_rects = [
+                # High Prod / High Resource — top-right
+                dict(x0=resource_threshold, x1=rx_max, y0=prod_threshold, y1=ry_max,
+                     fillcolor=COLOR_MAP_CLASS["High Prod / High Resource"], opacity=0.07),
+                # Low Prod / High Resource — bottom-right
+                dict(x0=resource_threshold, x1=rx_max, y0=ry_min, y1=prod_threshold,
+                     fillcolor=COLOR_MAP_CLASS["Low Prod / High Resource"], opacity=0.07),
+                # High Prod / Low Resource — top-left
+                dict(x0=rx_min, x1=resource_threshold, y0=prod_threshold, y1=ry_max,
+                     fillcolor=COLOR_MAP_CLASS["High Prod / Low Resource"], opacity=0.07),
+                # Low Prod / Low Resource — bottom-left
+                dict(x0=rx_min, x1=resource_threshold, y0=ry_min, y1=prod_threshold,
+                     fillcolor=COLOR_MAP_CLASS["Low Prod / Low Resource"], opacity=0.07),
+            ]
+            for rect in quad_rects:
+                fig_quad.add_shape(
+                    type="rect", xref="x", yref="y", layer="below",
+                    line=dict(width=0), **rect,
+                )
+
+            # Threshold lines
+            fig_quad.add_hline(y=prod_threshold, line_dash="dot", line_color="grey",
+                               annotation_text=f"Prod σ = {prod_threshold}")
+            fig_quad.add_vline(x=resource_threshold, line_dash="dot", line_color="grey",
+                               annotation_text=f"Resource σ = {resource_threshold}")
+            fig_quad.add_hline(y=0, line_dash="dash", line_color="black", line_width=0.5)
+            fig_quad.add_vline(x=0, line_dash="dash", line_color="black", line_width=0.5)
+
+            st.plotly_chart(fig_quad, use_container_width=True)
+
+        # ---- Summary ----
         st.subheader("Summary")
         summary = pros_chart["Classification"].value_counts().reset_index()
         summary.columns = ["Classification", "Count"]
+        # Ensure consistent order
+        quad_order = list(COLOR_MAP_CLASS.keys())
+        summary["Classification"] = pd.Categorical(summary["Classification"], categories=quad_order, ordered=True)
+        summary = summary.sort_values("Classification").reset_index(drop=True)
         st.dataframe(summary, use_container_width=True)
 
         cls_display = pros_chart[[
             "Label", "Latitude", "Longitude",
             SECTION_OOIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90", "WF",
-            "Z_EUR", "Z_IP90", "Z_1Y", "Composite_Z", "Classification"
-        ]].sort_values("Composite_Z", ascending=False).reset_index(drop=True)
+            "Z_EUR", "Z_IP90", "Z_1Y", "Productivity_Z", "Resource_Z", "Classification"
+        ]].sort_values("Productivity_Z", ascending=False).reset_index(drop=True)
         st.dataframe(cls_display, use_container_width=True)
         st.download_button(
             "📥 Download Classified Prospects",
