@@ -20,7 +20,7 @@ from sklearn.linear_model import LinearRegression, RANSACRegressor
 st.set_page_config(layout="wide", page_title="Bakken Inventory Optimizer", page_icon="🛢️")
 
 NULL_STYLE = {"fillColor": "#ffffff", "fillOpacity": 0, "color": "#888", "weight": 0.25}
-DEFAULT_BUFFER_M = 800
+DEFAULT_BUFFER_M = 900
 
 # ---- 4-quadrant colour scheme ----
 COLOR_MAP_CLASS = {
@@ -230,7 +230,7 @@ section_gradient = st.sidebar.selectbox("Colour sections by", ["None"] + SEC_NUM
 show_layers = {
     "Infill": st.sidebar.checkbox("Show Infills", value=True),
     "Lease Line": st.sidebar.checkbox("Show Lease Lines", value=True),
-    "Merged": st.sidebar.checkbox("Show Merged", value=True),
+    "Merged": st.sidebar.checkbox("Show Merged", value=False),
 }
 
 LAYER_GDFS = {"Infill": infills_gdf, "Lease Line": lease_lines_gdf, "Merged": merged_gdf}
