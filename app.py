@@ -32,7 +32,9 @@ COLOR_MAP_CLASS = {
 
 WELL_COLS = ["Norm EUR", "Norm 1Y Cuml", "Norm IP90"]
 SECTION_OOIP_COL = "SectionOOIP"
-ALL_METRIC_COLS = WELL_COLS + ["WF", SECTION_OOIP_COL]
+SECTION_URF_COL = "SectionURF"                                      # <-- NEW: URF column name
+REMAINING_RESOURCE_COL = "Remaining Resource"                        # <-- NEW: derived column
+ALL_METRIC_COLS = WELL_COLS + ["WF", SECTION_OOIP_COL, SECTION_URF_COL, REMAINING_RESOURCE_COL]  # <-- UPDATED
 TOOLTIP_STYLE = (
     "font-size:11px;padding:3px 6px;background:rgba(255,255,255,0.92);"
     "border:1px solid #333;border-radius:3px;"
@@ -108,24 +110,6 @@ def fit_trend(x, y):
 
 
 def classify_quadrant(prod_z, resource_z, prod_thresh, resource_thresh):
-    """Classify a prospect into one of four quadrants.
-
-    Parameters
-    ----------
-    prod_z : float
-        Composite productivity Z-score (residual from OOIP→production trends).
-    resource_z : float
-        Resource Z-score (SectionOOIP relative to field distribution).
-    prod_thresh : float
-        Sigma threshold for high/low productivity.
-    resource_thresh : float
-        Sigma threshold for high/low resource.
-
-    Returns
-    -------
-    str
-        One of the four quadrant labels.
-    """
     high_prod = prod_z >= prod_thresh
     high_resource = resource_z >= resource_thresh
     if high_prod and high_resource:
@@ -146,14 +130,12 @@ def prospect_coords_latlon(geom, transformer):
 
 
 def make_prospect_label(gdf):
-    """Use UWI column if it exists; otherwise leave label blank."""
     if "UWI" in gdf.columns:
         return gdf["UWI"].astype(str).str.strip().replace("", np.nan).replace("nan", np.nan)
     return pd.Series("", index=gdf.index)
 
 
 def fmt_val(col, v):
-    """Format a numeric value for tooltips."""
     if pd.isna(v):
         return "—"
     return f"{v:,.0f}" if abs(v) > 100 else f"{v:.3f}"
@@ -192,6 +174,9 @@ def load_data():
 
     section_df["Section"] = section_df["Section"].astype(str).str.strip()
     section_df[SECTION_OOIP_COL] = pd.to_numeric(section_df[SECTION_OOIP_COL], errors="coerce")
+    # --- NEW: parse URF from section sheet ---
+    section_df[SECTION_URF_COL] = pd.to_numeric(section_df.get(SECTION_URF_COL, np.nan), errors="coerce")
+
     sec_numeric_cols = [
         c for c in section_df.columns
         if c != "Section" and pd.api.types.is_numeric_dtype(section_df[c])
@@ -200,10 +185,14 @@ def load_data():
     lines["UWI"] = lines["UWI"].astype(str).str.strip()
     points["UWI"] = points["UWI"].astype(str).str.strip()
 
-    well_df = well_df.merge(section_df[["Section", SECTION_OOIP_COL]], on="Section", how="left")
+    # --- UPDATED: merge both OOIP and URF onto well_df ---
+    well_df_out = well_df.merge(
+        section_df[["Section", SECTION_OOIP_COL, SECTION_URF_COL]],
+        on="Section", how="left",
+    )
 
     return (lines, points, grid, units, infills, lease_lines, merged, land,
-            well_df, section_df, sec_numeric_cols)
+            well_df_out, section_df, sec_numeric_cols)
 
 
 (lines_gdf, points_gdf, grid_gdf, units_gdf, infills_gdf, lease_lines_gdf,
@@ -267,7 +256,6 @@ prospects = gpd.GeoDataFrame(
     geometry="geometry", crs=infills_gdf.crs,
 )
 
-# Build labels: use UWI if present, else leave blank (unnamed)
 prospects["Label"] = make_prospect_label(prospects)
 unnamed_mask = prospects["Label"].isna() | (prospects["Label"] == "")
 prospects.loc[unnamed_mask, "Label"] = ""
@@ -332,12 +320,14 @@ def analyze_prospects(pros, prox, sections, buffer_m):
     else:
         wf_idw = pd.Series(np.nan, index=pros.index)
 
-    # Mean SectionOOIP from intersecting grid cells
+    # --- Mean SectionOOIP AND Mean SectionURF from intersecting grid cells ---
     sec_join = gpd.sjoin(
-        sections[["geometry", SECTION_OOIP_COL]], buffer_gdf,
+        sections[["geometry", SECTION_OOIP_COL, SECTION_URF_COL]],  # <-- UPDATED: include URF
+        buffer_gdf,
         how="inner", predicate="intersects",
     )
     ooip_mean = sec_join.groupby("index_right")[SECTION_OOIP_COL].mean().reindex(pros.index)
+    urf_mean  = sec_join.groupby("index_right")[SECTION_URF_COL].mean().reindex(pros.index)  # <-- NEW
 
     out = pd.DataFrame(index=pros.index)
     out["_prospect_type"] = pros["_prospect_type"].values
@@ -347,6 +337,9 @@ def analyze_prospects(pros, prox, sections, buffer_m):
         out[col] = idw_results[col].values
     out["WF"] = wf_idw.values
     out[SECTION_OOIP_COL] = ooip_mean.values
+    out[SECTION_URF_COL] = urf_mean.values                                          # <-- NEW
+    # --- NEW: Remaining Resource = Mean OOIP × (1 − Mean URF) ---
+    out[REMAINING_RESOURCE_COL] = out[SECTION_OOIP_COL] * (1 - out[SECTION_URF_COL])
     return out
 
 
@@ -395,39 +388,51 @@ else:
     )
     resource_threshold = st.sidebar.slider(
         "Resource Z threshold (σ)", -1.0, 2.0, 0.0, 0.05,
-        help="Prospects above this OOIP-Z are 'High Resource'",
+        help="Prospects above this Remaining-Resource-Z are 'High Resource'",
         key="res_thresh",
     )
 
-    field = well_df.dropna(subset=[SECTION_OOIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90"]).copy()
-    field = field[field[SECTION_OOIP_COL] > 0].copy()
+    # --- UPDATED: compute Remaining Resource for field wells too ---
+    field = well_df.dropna(subset=[SECTION_OOIP_COL, SECTION_URF_COL,
+                                    "Norm EUR", "Norm 1Y Cuml", "Norm IP90"]).copy()
+    field = field[(field[SECTION_OOIP_COL] > 0) & (field[SECTION_URF_COL].notna())].copy()
+    field[REMAINING_RESOURCE_COL] = field[SECTION_OOIP_COL] * (1 - field[SECTION_URF_COL])
 
     if len(field) >= 2:
         for ratio_name, src in [("EUR_ratio", "Norm EUR"), ("Y1_ratio", "Norm 1Y Cuml"), ("IP90_ratio", "Norm IP90")]:
-            field[ratio_name] = field[src] / field[SECTION_OOIP_COL]
+            field[ratio_name] = field[src] / field[REMAINING_RESOURCE_COL]  # <-- UPDATED: ratio vs remaining
 
-        eur_model = fit_trend(field[SECTION_OOIP_COL], field["Norm EUR"])
-        ip90_model = fit_trend(field[SECTION_OOIP_COL], field["Norm IP90"])
-        y1_model = fit_trend(field[SECTION_OOIP_COL], field["Norm 1Y Cuml"])
+        # --- UPDATED: trend lines are now fit against Remaining Resource ---
+        eur_model = fit_trend(field[REMAINING_RESOURCE_COL], field["Norm EUR"])
+        ip90_model = fit_trend(field[REMAINING_RESOURCE_COL], field["Norm IP90"])
+        y1_model = fit_trend(field[REMAINING_RESOURCE_COL], field["Norm 1Y Cuml"])
 
         if all(m is not None for m in [eur_model, ip90_model, y1_model]):
             resid_std = {}
-            for tag, model, src in [("EUR", eur_model, "Norm EUR"), ("IP90", ip90_model, "Norm IP90"), ("Y1", y1_model, "Norm 1Y Cuml")]:
-                field[f"{tag}_resid"] = field[src] - model.predict(field[SECTION_OOIP_COL].values.reshape(-1, 1))
+            for tag, model, src in [("EUR", eur_model, "Norm EUR"),
+                                     ("IP90", ip90_model, "Norm IP90"),
+                                     ("Y1", y1_model, "Norm 1Y Cuml")]:
+                # --- UPDATED: residuals computed from Remaining Resource trend ---
+                field[f"{tag}_resid"] = (
+                    field[src] - model.predict(field[REMAINING_RESOURCE_COL].values.reshape(-1, 1))
+                )
                 resid_std[tag] = field[f"{tag}_resid"].std()
 
-            # Field-level OOIP stats for resource Z-score
-            field_ooip_mean = field[SECTION_OOIP_COL].mean()
-            field_ooip_std = field[SECTION_OOIP_COL].std()
+            # --- UPDATED: Resource Z-score is now based on Remaining Resource ---
+            field_rr_mean = field[REMAINING_RESOURCE_COL].mean()
+            field_rr_std = field[REMAINING_RESOURCE_COL].std()
 
-            pros_cls = prospects.dropna(subset=[SECTION_OOIP_COL] + WELL_COLS).copy()
-            pros_cls = pros_cls[pros_cls[SECTION_OOIP_COL] > 0].copy()
+            pros_cls = prospects.dropna(
+                subset=[REMAINING_RESOURCE_COL] + WELL_COLS  # <-- UPDATED
+            ).copy()
+            pros_cls = pros_cls[pros_cls[REMAINING_RESOURCE_COL] > 0].copy()  # <-- UPDATED
 
             if not pros_cls.empty:
-                ooip_vals = pros_cls[SECTION_OOIP_COL].values.reshape(-1, 1)
-                pros_cls["EUR_pred"] = eur_model.predict(ooip_vals)
-                pros_cls["IP90_pred"] = ip90_model.predict(ooip_vals)
-                pros_cls["Y1_pred"] = y1_model.predict(ooip_vals)
+                # --- UPDATED: predictions use Remaining Resource ---
+                rr_vals = pros_cls[REMAINING_RESOURCE_COL].values.reshape(-1, 1)
+                pros_cls["EUR_pred"] = eur_model.predict(rr_vals)
+                pros_cls["IP90_pred"] = ip90_model.predict(rr_vals)
+                pros_cls["Y1_pred"] = y1_model.predict(rr_vals)
 
                 for tag, src, std in [("Z_EUR", "Norm EUR", resid_std["EUR"]),
                                        ("Z_IP90", "Norm IP90", resid_std["IP90"]),
@@ -435,22 +440,20 @@ else:
                     pred_map = {"Z_EUR": "EUR_pred", "Z_IP90": "IP90_pred", "Z_1Y": "Y1_pred"}
                     pros_cls[tag] = (pros_cls[src] - pros_cls[pred_map[tag]]) / std if std > 0 else 0
 
-                # Productivity axis: weighted composite Z of trend residuals
                 pros_cls["Productivity_Z"] = (
                     (cw_eur / 100) * pros_cls["Z_EUR"] +
                     (cw_1y / 100) * pros_cls["Z_1Y"] +
                     (cw_ip90 / 100) * pros_cls["Z_IP90"]
                 )
 
-                # Resource axis: OOIP Z-score relative to the field
-                if field_ooip_std > 0:
+                # --- UPDATED: Resource Z is now Remaining Resource Z ---
+                if field_rr_std > 0:
                     pros_cls["Resource_Z"] = (
-                        (pros_cls[SECTION_OOIP_COL] - field_ooip_mean) / field_ooip_std
+                        (pros_cls[REMAINING_RESOURCE_COL] - field_rr_mean) / field_rr_std
                     )
                 else:
                     pros_cls["Resource_Z"] = 0.0
 
-                # 4-quadrant classification
                 pros_cls["Classification"] = pros_cls.apply(
                     lambda r: classify_quadrant(
                         r["Productivity_Z"], r["Resource_Z"],
@@ -592,7 +595,6 @@ existing_display = proximal_wells.copy().to_crs(4326)
 
 
 def build_tooltip_label(row, include_metrics=True):
-    """Build HTML tooltip. Shows name only if Label is non-empty."""
     parts = []
     if row.get("Label", ""):
         parts.append(f"<b>{row['Label']}</b>")
@@ -872,7 +874,13 @@ if classification_ready and "Classification" in p.columns:
 
     if not pros_chart.empty:
         col1, col2 = st.columns(2)
-        x_range = np.linspace(field[SECTION_OOIP_COL].min(), field[SECTION_OOIP_COL].max(), 100)
+
+        # --- UPDATED: x-axis range uses Remaining Resource ---
+        x_range = np.linspace(
+            field[REMAINING_RESOURCE_COL].min(),
+            field[REMAINING_RESOURCE_COL].max(),
+            100,
+        )
 
         chart_configs = [
             ("Norm EUR", eur_model, col1),
@@ -882,13 +890,15 @@ if classification_ready and "Classification" in p.columns:
 
         for y_col, model, target_col in chart_configs:
             with target_col:
+                # --- UPDATED: x-axis is now Remaining Resource ---
                 fig = px.scatter(
-                    pros_chart, x=SECTION_OOIP_COL, y=y_col,
+                    pros_chart, x=REMAINING_RESOURCE_COL, y=y_col,
                     color="Classification", color_discrete_map=COLOR_MAP_CLASS,
-                    hover_data=["Label"], title=f"{y_col} vs {SECTION_OOIP_COL}",
+                    hover_data=["Label"],
+                    title=f"{y_col} vs {REMAINING_RESOURCE_COL}",
                 )
                 fig.add_trace(go.Scatter(
-                    x=field[SECTION_OOIP_COL], y=field[y_col],
+                    x=field[REMAINING_RESOURCE_COL], y=field[y_col],
                     mode="markers", name="Field UWIs",
                     marker=dict(color="lightgrey", size=4, opacity=0.5),
                 ))
@@ -905,27 +915,24 @@ if classification_ready and "Classification" in p.columns:
                 color="Classification", color_discrete_map=COLOR_MAP_CLASS,
                 hover_data=["Label"],
                 title="Productivity Z vs Resource Z (4-Quadrant)",
-                labels={"Resource_Z": "Resource Z (SectionOOIP)", "Productivity_Z": "Productivity Z (Composite)"},
+                labels={
+                    "Resource_Z": f"Resource Z ({REMAINING_RESOURCE_COL})",  # <-- UPDATED label
+                    "Productivity_Z": "Productivity Z (Composite)",
+                },
             )
 
-            # Axis ranges for shaded rectangles
             rx_min = min(pros_chart["Resource_Z"].min(), -2) - 0.5
             rx_max = max(pros_chart["Resource_Z"].max(), 2) + 0.5
             ry_min = min(pros_chart["Productivity_Z"].min(), -2) - 0.5
             ry_max = max(pros_chart["Productivity_Z"].max(), 2) + 0.5
 
-            # Quadrant shading
             quad_rects = [
-                # High Prod / High Resource — top-right
                 dict(x0=resource_threshold, x1=rx_max, y0=prod_threshold, y1=ry_max,
                      fillcolor=COLOR_MAP_CLASS["High Prod / High Resource"], opacity=0.07),
-                # Low Prod / High Resource — bottom-right
                 dict(x0=resource_threshold, x1=rx_max, y0=ry_min, y1=prod_threshold,
                      fillcolor=COLOR_MAP_CLASS["Low Prod / High Resource"], opacity=0.07),
-                # High Prod / Low Resource — top-left
                 dict(x0=rx_min, x1=resource_threshold, y0=prod_threshold, y1=ry_max,
                      fillcolor=COLOR_MAP_CLASS["High Prod / Low Resource"], opacity=0.07),
-                # Low Prod / Low Resource — bottom-left
                 dict(x0=rx_min, x1=resource_threshold, y0=ry_min, y1=prod_threshold,
                      fillcolor=COLOR_MAP_CLASS["Low Prod / Low Resource"], opacity=0.07),
             ]
@@ -935,7 +942,6 @@ if classification_ready and "Classification" in p.columns:
                     line=dict(width=0), **rect,
                 )
 
-            # Threshold lines
             fig_quad.add_hline(y=prod_threshold, line_dash="dot", line_color="grey",
                                annotation_text=f"Prod σ = {prod_threshold}")
             fig_quad.add_vline(x=resource_threshold, line_dash="dot", line_color="grey",
@@ -949,15 +955,16 @@ if classification_ready and "Classification" in p.columns:
         st.subheader("Summary")
         summary = pros_chart["Classification"].value_counts().reset_index()
         summary.columns = ["Classification", "Count"]
-        # Ensure consistent order
         quad_order = list(COLOR_MAP_CLASS.keys())
         summary["Classification"] = pd.Categorical(summary["Classification"], categories=quad_order, ordered=True)
         summary = summary.sort_values("Classification").reset_index(drop=True)
         st.dataframe(summary, use_container_width=True)
 
+        # --- UPDATED: include URF and Remaining Resource in classification export ---
         cls_display = pros_chart[[
             "Label", "Latitude", "Longitude",
-            SECTION_OOIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90", "WF",
+            SECTION_OOIP_COL, SECTION_URF_COL, REMAINING_RESOURCE_COL,
+            "Norm EUR", "Norm 1Y Cuml", "Norm IP90", "WF",
             "Z_EUR", "Z_IP90", "Z_1Y", "Productivity_Z", "Resource_Z", "Classification"
         ]].sort_values("Productivity_Z", ascending=False).reset_index(drop=True)
         st.dataframe(cls_display, use_container_width=True)
