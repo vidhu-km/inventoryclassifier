@@ -745,20 +745,31 @@ well_fg.add_to(m)
 prospect_fg = folium.FeatureGroup(name="Prospect Wells", show=True)
 has_classification = classification_ready and "Classification" in p.columns
 
+# Columns to never show in the prospect tooltip
+_TOOLTIP_SKIP = {"geometry", "_label_is_section", "_prospect_type", "_buffer_color"}
+
 for _, row in p_lines_display.iterrows():
     cls_val = row.get("Classification", None) if has_classification else None
     line_color = COLOR_MAP_CLASS.get(cls_val, "red") if pd.notna(cls_val) else "red"
 
+    is_section = str(row.get("_label_is_section", "False")) == "True"
+
     tip_parts = []
     for c in p_lines_display.columns:
-        if c == "geometry":
+        if c in _TOOLTIP_SKIP:
             continue
         val = row[c]
-        if pd.notna(val) and str(val).strip():
-            if c == "Label" and str(row.get("_label_is_section", "False")) == "True":
+        # Skip NaN / empty / literal "nan"
+        if pd.isna(val) or str(val).strip() == "" or str(val).strip().lower() == "nan":
+            continue
+        # Show the Label line with "Section:" prefix when appropriate
+        if c == "Label":
+            if is_section:
                 tip_parts.append(f"<b>Section:</b> {val}")
             else:
-                tip_parts.append(f"<b>{c}:</b> {val}")
+                tip_parts.append(f"<b>UWI:</b> {val}")
+        else:
+            tip_parts.append(f"<b>{c}:</b> {val}")
 
     folium.GeoJson(
         row.geometry.__geo_interface__,
