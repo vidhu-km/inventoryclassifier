@@ -222,7 +222,7 @@ section_gradient = st.sidebar.selectbox("Colour sections by", ["None"] + SEC_NUM
 show_layers = {
     "Infill": st.sidebar.checkbox("Show Infills", value=True),
     "Lease Line": st.sidebar.checkbox("Show Lease Lines", value=True),
-    "Merged": st.sidebar.checkbox("Show Merged", value=False),
+    "Merged": st.sidebar.checkbox("Show Merged", value=True),
 }
 
 LAYER_GDFS = {"Infill": infills_gdf, "Lease Line": lease_lines_gdf, "Merged": merged_gdf}
@@ -247,7 +247,7 @@ prospects = gpd.GeoDataFrame(
 )
 
 # ==========================================================
-# Label prospects — use section name for those without a UWI
+# Label prospects — use UWI if present, else section from endpoint
 # ==========================================================
 prospects["Label"] = make_prospect_label(prospects)
 unnamed_mask = prospects["Label"].isna() | (prospects["Label"] == "")
@@ -536,6 +536,7 @@ existing_display = proximal_wells.copy().to_crs(4326)
 
 
 def build_tooltip_label(row, include_metrics=True):
+    """Build tooltip HTML for prospect wells only."""
     parts = []
     label = row.get("Label", "")
     if label:
@@ -543,7 +544,7 @@ def build_tooltip_label(row, include_metrics=True):
         if is_section:
             parts.append(f"<b>Section: {label}</b>")
         else:
-            parts.append(f"<b>{label}</b>")
+            parts.append(f"<b>UWI: {label}</b>")
     if include_metrics:
         parts.append(f"Proximal Wells: {row.get('Proximal_Count', '—')}")
         for col in ALL_METRIC_COLS:
@@ -552,20 +553,14 @@ def build_tooltip_label(row, include_metrics=True):
     return "<br>".join(parts) if parts else "Prospect"
 
 
-# Buffer GeoDataFrame
+# Buffer GeoDataFrame — geometry only, no tooltip data needed
 buffer_records = []
 for idx, row in p.iterrows():
     rec = {
-        "Label": row["Label"],
-        "_label_is_section": row.get("_label_is_section", False),
         "_passes_filter": row["_passes_filter"],
         "_no_proximal": row["_no_proximal"],
-        "Proximal_Count": row.get("Proximal_Count", 0),
         "geometry": row.geometry.buffer(buffer_distance, cap_style=2),
     }
-    for col in ALL_METRIC_COLS:
-        if col in row.index:
-            rec[col] = row[col]
     buffer_records.append(rec)
 
 buffer_gdf = gpd.GeoDataFrame(buffer_records, crs=p.crs).to_crs(4326)
@@ -592,7 +587,13 @@ st.info(
 )
 
 # ==========================================================
-# MAP
+# MAP — Layer order (bottom → top):
+#   1. Bakken Land
+#   2. Units
+#   3. Section Grid
+#   4. Existing Wells
+#   5. Prospect Buffer
+#   6. Prospect Wells
 # ==========================================================
 bounds = p.total_bounds
 cx, cy = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
@@ -601,14 +602,28 @@ clon, clat = transformer_to_4326.transform(cx, cy)
 m = folium.Map(location=[clat, clon], zoom_start=11, tiles="CartoDB positron")
 MiniMap(toggle_display=True, position="bottomleft").add_to(m)
 
-# Land
-folium.FeatureGroup(name="Bakken Land", show=True).add_child(
-    folium.GeoJson(land_display.to_json(), style_function=lambda _: {
-        "fillColor": "#fff9c4", "color": "#fff9c4", "weight": 0.5, "fillOpacity": 0.2,
-    })
-).add_to(m)
+# ── Layer 1: Bakken Land (bottom) ──
+land_fg = folium.FeatureGroup(name="Bakken Land", show=True)
+folium.GeoJson(
+    land_display.to_json(),
+    style_function=lambda _: {
+        "fillColor": "#fff9c4", "color": "#fff9c4",
+        "weight": 0.5, "fillOpacity": 0.2,
+    },
+).add_to(land_fg)
+land_fg.add_to(m)
 
-# Section grid
+# ── Layer 2: Units ──
+units_fg = folium.FeatureGroup(name="Units", show=True)
+folium.GeoJson(
+    units_display.to_json(),
+    style_function=lambda _: {
+        "color": "black", "weight": 2, "fillOpacity": 0, "interactive": False,
+    },
+).add_to(units_fg)
+units_fg.add_to(m)
+
+# ── Layer 3: Section Grid ──
 if section_gradient != "None" and section_gradient in section_display.columns:
     grad_vals = section_display[section_gradient].dropna()
     if not grad_vals.empty:
@@ -639,57 +654,13 @@ folium.GeoJson(
     tooltip=folium.GeoJsonTooltip(
         fields=sec_tip_fields, aliases=[f"{f}:" for f in sec_tip_fields],
         localize=True, sticky=True,
-        style=f"font-size:11px;padding:4px 8px;background:rgba(255,255,255,0.9);"
-              f"border:1px solid #333;border-radius:3px;",
+        style="font-size:11px;padding:4px 8px;background:rgba(255,255,255,0.9);"
+              "border:1px solid #333;border-radius:3px;",
     ),
 ).add_to(section_fg)
 section_fg.add_to(m)
 
-# Units
-folium.FeatureGroup(name="Units", show=True).add_child(
-    folium.GeoJson(units_display.to_json(), style_function=lambda _: {
-        "color": "black", "weight": 2, "fillOpacity": 0, "interactive": False,
-    })
-).add_to(m)
-
-# Buffers — all translucent black
-buffer_fg = folium.FeatureGroup(name="Prospect Buffers")
-
-BUFFER_STYLE_PASS = {
-    "fillColor": "#000000", "fillOpacity": 0.08,
-    "color": "#000000", "weight": 0.5, "opacity": 0.3,
-}
-BUFFER_STYLE_FAIL = {
-    "fillColor": "#000000", "fillOpacity": 0.04,
-    "color": "#000000", "weight": 0.3, "opacity": 0.15,
-}
-BUFFER_STYLE_NO_PROX = {
-    "fillColor": "#000000", "fillOpacity": 0.04,
-    "color": "#000000", "weight": 0.5, "dashArray": "5 5", "opacity": 0.2,
-}
-
-for _, brow in buffer_gdf[buffer_gdf["_passes_filter"]].iterrows():
-    tip_html = build_tooltip_label(brow)
-    folium.GeoJson(
-        brow.geometry.__geo_interface__,
-        style_function=lambda _: BUFFER_STYLE_PASS,
-        tooltip=folium.Tooltip(tip_html, sticky=True, style=TOOLTIP_STYLE),
-    ).add_to(buffer_fg)
-
-for _, brow in buffer_gdf[~buffer_gdf["_passes_filter"] & ~buffer_gdf["_no_proximal"]].iterrows():
-    folium.GeoJson(
-        brow.geometry.__geo_interface__,
-        style_function=lambda _: BUFFER_STYLE_FAIL,
-    ).add_to(buffer_fg)
-
-for _, brow in buffer_gdf[buffer_gdf["_no_proximal"]].iterrows():
-    folium.GeoJson(
-        brow.geometry.__geo_interface__,
-        style_function=lambda _: BUFFER_STYLE_NO_PROX,
-    ).add_to(buffer_fg)
-buffer_fg.add_to(m)
-
-# Existing wells
+# ── Layer 4: Existing Wells ──
 well_fg = folium.FeatureGroup(name="Existing Wells")
 line_wells = existing_display[existing_display.geometry.type != "Point"]
 point_wells = existing_display[existing_display.geometry.type == "Point"]
@@ -741,7 +712,45 @@ for _, row in point_wells.iterrows():
     ).add_to(well_fg)
 well_fg.add_to(m)
 
-# Prospect lines
+# ── Layer 5: Prospect Buffers (no fill, dashed borders, NO tooltip) ──
+buffer_fg = folium.FeatureGroup(name="Prospect Buffers")
+
+BUFFER_STYLE_PASS = {
+    "fillOpacity": 0,
+    "color": "#000000", "weight": 1.2, "opacity": 0.6,
+    "dashArray": "6 4",
+}
+BUFFER_STYLE_FAIL = {
+    "fillOpacity": 0,
+    "color": "#000000", "weight": 0.8, "opacity": 0.25,
+    "dashArray": "6 4",
+}
+BUFFER_STYLE_NO_PROX = {
+    "fillOpacity": 0,
+    "color": "#000000", "weight": 0.8, "opacity": 0.3,
+    "dashArray": "4 6",
+}
+
+for _, brow in buffer_gdf[buffer_gdf["_passes_filter"]].iterrows():
+    folium.GeoJson(
+        brow.geometry.__geo_interface__,
+        style_function=lambda _: BUFFER_STYLE_PASS,
+    ).add_to(buffer_fg)
+
+for _, brow in buffer_gdf[~buffer_gdf["_passes_filter"] & ~buffer_gdf["_no_proximal"]].iterrows():
+    folium.GeoJson(
+        brow.geometry.__geo_interface__,
+        style_function=lambda _: BUFFER_STYLE_FAIL,
+    ).add_to(buffer_fg)
+
+for _, brow in buffer_gdf[buffer_gdf["_no_proximal"]].iterrows():
+    folium.GeoJson(
+        brow.geometry.__geo_interface__,
+        style_function=lambda _: BUFFER_STYLE_NO_PROX,
+    ).add_to(buffer_fg)
+buffer_fg.add_to(m)
+
+# ── Layer 6: Prospect Wells (top — with tooltips) ──
 prospect_fg = folium.FeatureGroup(name="Prospect Wells", show=True)
 has_classification = classification_ready and "Classification" in p.columns
 
@@ -780,10 +789,12 @@ for _, row in p_lines_display.iterrows():
 
     ep = endpoint_of_geom(row.geometry)
     if ep is not None:
+        # Build the same tooltip for the circle marker
         folium.CircleMarker(
             location=[ep.y, ep.x], radius=3,
             color=line_color, fill=True, fill_color=line_color,
             fill_opacity=0.9, weight=1,
+            tooltip=folium.Tooltip("<br>".join(tip_parts), sticky=True, style="font-size:12px"),
         ).add_to(prospect_fg)
 
 prospect_fg.add_to(m)
