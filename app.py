@@ -32,8 +32,8 @@ COLOR_MAP_CLASS = {
 
 WELL_COLS = ["Norm EUR", "Norm 1Y Cuml", "Norm IP90"]
 SECTION_OOIP_COL = "SectionOOIP"
-SECTION_ROIP_COL = "SectionROIP"                                                    # <-- NEW
-ALL_METRIC_COLS = WELL_COLS + ["WF", SECTION_OOIP_COL, SECTION_ROIP_COL]            # <-- UPDATED
+SECTION_ROIP_COL = "SectionROIP"
+ALL_METRIC_COLS = WELL_COLS + ["WF", SECTION_OOIP_COL, SECTION_ROIP_COL]
 TOOLTIP_STYLE = (
     "font-size:11px;padding:3px 6px;background:rgba(255,255,255,0.92);"
     "border:1px solid #333;border-radius:3px;"
@@ -82,13 +82,6 @@ def endpoint_of_geom(geom):
     if geom.geom_type == "Point":
         return geom
     return None
-
-
-def get_ylgn_hex(value, vmin, vmax):
-    if pd.isna(value) or vmin == vmax:
-        return "#cccccc"
-    rgba = mpl_cm.get_cmap("YlGn")(mcolors.Normalize(vmin, vmax)(value))
-    return mcolors.to_hex(rgba)
 
 
 def fit_trend(x, y):
@@ -173,7 +166,7 @@ def load_data():
 
     section_df["Section"] = section_df["Section"].astype(str).str.strip()
     section_df[SECTION_OOIP_COL] = pd.to_numeric(section_df[SECTION_OOIP_COL], errors="coerce")
-    section_df[SECTION_ROIP_COL] = pd.to_numeric(section_df[SECTION_ROIP_COL], errors="coerce")  # <-- NEW
+    section_df[SECTION_ROIP_COL] = pd.to_numeric(section_df[SECTION_ROIP_COL], errors="coerce")
 
     sec_numeric_cols = [
         c for c in section_df.columns
@@ -183,9 +176,8 @@ def load_data():
     lines["UWI"] = lines["UWI"].astype(str).str.strip()
     points["UWI"] = points["UWI"].astype(str).str.strip()
 
-    # Merge both OOIP and ROIP onto well_df
     well_df_out = well_df.merge(
-        section_df[["Section", SECTION_OOIP_COL, SECTION_ROIP_COL]],  # <-- UPDATED
+        section_df[["Section", SECTION_OOIP_COL, SECTION_ROIP_COL]],
         on="Section", how="left",
     )
 
@@ -254,22 +246,23 @@ prospects = gpd.GeoDataFrame(
     geometry="geometry", crs=infills_gdf.crs,
 )
 
+# ==========================================================
+# Label prospects — use section name for those without a UWI
+# ==========================================================
 prospects["Label"] = make_prospect_label(prospects)
 unnamed_mask = prospects["Label"].isna() | (prospects["Label"] == "")
+prospects["_label_is_section"] = False
 
-# For unnamed prospects, find the section that the last coordinate (endpoint) falls in
 if unnamed_mask.any():
-    # Build a GeoDataFrame of endpoints for unnamed prospects
     unnamed_endpoints = []
     for idx in prospects[unnamed_mask].index:
         ep = endpoint_of_geom(prospects.at[idx, "geometry"])
         unnamed_endpoints.append({"_pidx": idx, "geometry": ep})
 
     ep_gdf = gpd.GeoDataFrame(unnamed_endpoints, crs=prospects.crs)
-    ep_gdf = ep_gdf[ep_gdf["geometry"].notna()]  # drop any that couldn't resolve
+    ep_gdf = ep_gdf[ep_gdf["geometry"].notna()]
 
     if not ep_gdf.empty:
-        # Spatial join: find which section grid cell each endpoint falls within
         ep_in_section = gpd.sjoin(
             ep_gdf,
             grid_gdf[["Section", "geometry"]],
@@ -277,27 +270,26 @@ if unnamed_mask.any():
             predicate="within",
         )
 
-        # If "within" misses due to floating-point issues, fall back to "intersects"
         still_missing = ep_in_section["Section"].isna()
         if still_missing.any():
-            fallback = gpd.sjoin(
-                ep_gdf.loc[still_missing.index],
-                grid_gdf[["Section", "geometry"]],
-                how="left",
-                predicate="intersects",
-            )
-            # Take the first match per endpoint
-            fallback = fallback[~fallback["Section"].isna()].groupby("_pidx").first()
-            for pidx, row in fallback.iterrows():
-                ep_in_section.loc[
-                    ep_in_section["_pidx"] == pidx, "Section"
-                ] = row["Section"]
+            missing_pidxs = ep_in_section.loc[still_missing, "_pidx"].values
+            fallback_src = ep_gdf[ep_gdf["_pidx"].isin(missing_pidxs)].copy()
+            if not fallback_src.empty:
+                fallback = gpd.sjoin(
+                    fallback_src,
+                    grid_gdf[["Section", "geometry"]],
+                    how="left",
+                    predicate="intersects",
+                )
+                fallback_first = fallback.dropna(subset=["Section"]).groupby("_pidx").first()
+                for pidx, row in fallback_first.iterrows():
+                    mask = ep_in_section["_pidx"] == pidx
+                    ep_in_section.loc[mask, "Section"] = row["Section"]
 
-        # Assign section names as labels
         for _, row in ep_in_section.dropna(subset=["Section"]).iterrows():
             prospects.at[row["_pidx"], "Label"] = str(row["Section"]).strip()
+            prospects.at[row["_pidx"], "_label_is_section"] = True
 
-# Final fallback: anything still unnamed gets a generic label
 unnamed_mask = prospects["Label"].isna() | (prospects["Label"] == "")
 prospects.loc[unnamed_mask, "Label"] = ""
 
@@ -321,7 +313,6 @@ def analyze_prospects(pros, prox, sections, buffer_m):
         {"_pidx": pros.index, "geometry": pros["_buffer"]}, crs=pros.crs,
     )
 
-    # IDW² for well-level metrics (midpoint-based)
     midpt_gdf = prox[prox["_midpoint"].notna()].copy()
     midpt_gdf = midpt_gdf.set_geometry(gpd.GeoSeries(midpt_gdf["_midpoint"], crs=prox.crs))
     well_hits = gpd.sjoin(midpt_gdf, buffer_gdf, how="inner", predicate="within")
@@ -342,7 +333,6 @@ def analyze_prospects(pros, prox, sections, buffer_m):
         .reindex(pros.index, fill_value="")
     )
 
-    # WF: geometry-intersect based
     wf_wells = prox[["UWI", "WF", "geometry"]].copy()
     wf_wells = wf_wells[wf_wells["WF"].notna()].copy()
 
@@ -361,14 +351,13 @@ def analyze_prospects(pros, prox, sections, buffer_m):
     else:
         wf_idw = pd.Series(np.nan, index=pros.index)
 
-    # Mean SectionOOIP AND Mean SectionROIP from intersecting grid cells
     sec_join = gpd.sjoin(
-        sections[["geometry", SECTION_OOIP_COL, SECTION_ROIP_COL]],  # <-- UPDATED: include ROIP
+        sections[["geometry", SECTION_OOIP_COL, SECTION_ROIP_COL]],
         buffer_gdf,
         how="inner", predicate="intersects",
     )
     ooip_mean = sec_join.groupby("index_right")[SECTION_OOIP_COL].mean().reindex(pros.index)
-    roip_mean = sec_join.groupby("index_right")[SECTION_ROIP_COL].mean().reindex(pros.index)  # <-- NEW
+    roip_mean = sec_join.groupby("index_right")[SECTION_ROIP_COL].mean().reindex(pros.index)
 
     out = pd.DataFrame(index=pros.index)
     out["_prospect_type"] = pros["_prospect_type"].values
@@ -378,8 +367,9 @@ def analyze_prospects(pros, prox, sections, buffer_m):
         out[col] = idw_results[col].values
     out["WF"] = wf_idw.values
     out[SECTION_OOIP_COL] = ooip_mean.values
-    out[SECTION_ROIP_COL] = roip_mean.values  # <-- NEW
+    out[SECTION_ROIP_COL] = roip_mean.values
     return out
+
 
 prospect_metrics = analyze_prospects(prospects, proximal_wells, section_enriched, buffer_distance)
 
@@ -430,7 +420,6 @@ else:
         key="res_thresh",
     )
 
-    # --- UPDATED: require ROIP instead of just OOIP for field wells ---
     field = well_df.dropna(subset=[SECTION_ROIP_COL, "Norm EUR", "Norm 1Y Cuml", "Norm IP90"]).copy()
     field = field[field[SECTION_ROIP_COL] > 0].copy()
 
@@ -438,7 +427,6 @@ else:
         for ratio_name, src in [("EUR_ratio", "Norm EUR"), ("Y1_ratio", "Norm 1Y Cuml"), ("IP90_ratio", "Norm IP90")]:
             field[ratio_name] = field[src] / field[SECTION_ROIP_COL]
 
-        # --- UPDATED: trend lines fit against SectionROIP ---
         eur_model = fit_trend(field[SECTION_ROIP_COL], field["Norm EUR"])
         ip90_model = fit_trend(field[SECTION_ROIP_COL], field["Norm IP90"])
         y1_model = fit_trend(field[SECTION_ROIP_COL], field["Norm 1Y Cuml"])
@@ -453,7 +441,6 @@ else:
                 )
                 resid_std[tag] = field[f"{tag}_resid"].std()
 
-            # --- UPDATED: Resource Z based on ROIP ---
             field_roip_mean = field[SECTION_ROIP_COL].mean()
             field_roip_std = field[SECTION_ROIP_COL].std()
 
@@ -539,83 +526,6 @@ if n_no_proximal:
     st.sidebar.warning(f"⚠️ {n_no_proximal} prospects have no nearby proximal wells")
 
 # ==========================================================
-# Ranking
-# ==========================================================
-st.sidebar.markdown("---")
-st.sidebar.subheader("📊 Ranking Metric")
-
-available_for_ranking = [c for c in ALL_METRIC_COLS if c in p.columns]
-selected_metric = st.sidebar.selectbox("Rank prospects by", available_for_ranking + ["High-Grade Score"])
-
-hg_selected, hg_lower_better, hg_weights, total_weight = {}, {}, {}, 0
-
-if selected_metric == "High-Grade Score":
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("⚙️ High-Grade Score")
-    st.sidebar.markdown("**Select metrics to include:**")
-    for col in available_for_ranking:
-        if st.sidebar.checkbox(col, value=False, key=f"hg_chk_{col}"):
-            hg_selected[col] = True
-            c1, c2 = st.sidebar.columns(2)
-            hg_lower_better[col] = c1.checkbox("Lower=better", value=False, key=f"hg_lb_{col}")
-            hg_weights[col] = c2.number_input("Weight %", 0, 100, 0, key=f"hg_w_{col}")
-    total_weight = sum(hg_weights.values())
-    if hg_selected:
-        if total_weight == 100:
-            st.sidebar.success(f"Total: {total_weight}%")
-        elif total_weight > 100:
-            st.sidebar.error(f"Total: {total_weight}% (Over by {total_weight - 100}%)")
-        else:
-            st.sidebar.warning(f"Total: {total_weight}% ({100 - total_weight}% remaining)")
-        st.sidebar.progress(min(total_weight / 100, 1.0))
-    else:
-        st.sidebar.info("Check at least one metric.")
-
-# Compute High-Grade Score
-if selected_metric == "High-Grade Score" and total_weight == 100 and hg_selected:
-    passing = p[p["_passes_filter"]].copy()
-    hgs = pd.Series(0.0, index=passing.index)
-    for col in hg_selected:
-        z = zscore_full(passing[col], p[col])
-        if hg_lower_better.get(col, False):
-            z = -z
-        hgs += (hg_weights[col] / 100.0) * z
-    p["HighGradeScore"] = np.nan
-    p.loc[passing.index, "HighGradeScore"] = hgs
-else:
-    p["HighGradeScore"] = np.nan
-
-if selected_metric == "High-Grade Score":
-    metric_col = "HighGradeScore"
-    ascending = False
-else:
-    metric_col = selected_metric
-    ascending = st.sidebar.checkbox(f"Lower {selected_metric} = better?", value=False, key="rank_asc")
-
-# ==========================================================
-# Buffer colours
-# ==========================================================
-passing_vals = p[p["_passes_filter"]][metric_col].dropna()
-if not passing_vals.empty:
-    if ascending:
-        gmap_vmin, gmap_vmax = float(-passing_vals.max()), float(-passing_vals.min())
-    else:
-        gmap_vmin, gmap_vmax = float(passing_vals.min()), float(passing_vals.max())
-else:
-    gmap_vmin, gmap_vmax = 0.0, 1.0
-
-label_color_map = {}
-for idx_val in p[p["_passes_filter"]].index:
-    row = p.loc[idx_val]
-    val = row.get(metric_col, np.nan)
-    label_color_map[row["Label"]] = (
-        get_ylgn_hex(-val if ascending else val, gmap_vmin, gmap_vmax)
-        if pd.notna(val) else "#cccccc"
-    )
-
-p["_buffer_color"] = p["Label"].map(label_color_map).fillna("#cccccc")
-
-# ==========================================================
 # Display-ready data (4326)
 # ==========================================================
 transformer_to_4326 = Transformer.from_crs("EPSG:26913", "EPSG:4326", always_xy=True)
@@ -627,8 +537,13 @@ existing_display = proximal_wells.copy().to_crs(4326)
 
 def build_tooltip_label(row, include_metrics=True):
     parts = []
-    if row.get("Label", ""):
-        parts.append(f"<b>{row['Label']}</b>")
+    label = row.get("Label", "")
+    if label:
+        is_section = row.get("_label_is_section", False)
+        if is_section:
+            parts.append(f"<b>Section: {label}</b>")
+        else:
+            parts.append(f"<b>{label}</b>")
     if include_metrics:
         parts.append(f"Proximal Wells: {row.get('Proximal_Count', '—')}")
         for col in ALL_METRIC_COLS:
@@ -642,24 +557,22 @@ buffer_records = []
 for idx, row in p.iterrows():
     rec = {
         "Label": row["Label"],
+        "_label_is_section": row.get("_label_is_section", False),
         "_passes_filter": row["_passes_filter"],
         "_no_proximal": row["_no_proximal"],
-        "_buffer_color": row["_buffer_color"],
         "Proximal_Count": row.get("Proximal_Count", 0),
         "geometry": row.geometry.buffer(buffer_distance, cap_style=2),
     }
     for col in ALL_METRIC_COLS:
         if col in row.index:
             rec[col] = row[col]
-    if metric_col not in rec:
-        rec[metric_col] = row.get(metric_col, np.nan)
     buffer_records.append(rec)
 
 buffer_gdf = gpd.GeoDataFrame(buffer_records, crs=p.crs).to_crs(4326)
 
 # Prospect lines for display
 skip_cols = {"geometry", "_buffer", "_midpoint", "_passes_filter", "_no_proximal",
-             "_buffer_color", "_proximal_uwis"}
+             "_proximal_uwis"}
 keep_cols = [c for c in p.columns if c not in skip_cols]
 p_lines = p[keep_cols + ["geometry"]].copy()
 for c in p_lines.columns:
@@ -668,49 +581,15 @@ for c in p_lines.columns:
 p_lines_display = p_lines.to_crs(4326)
 
 # ==========================================================
-# Ranking table
-# ==========================================================
-rank_df = None
-if not (selected_metric == "High-Grade Score" and total_weight != 100):
-    display_cols = ["Label", "_prospect_type", "Latitude", "Longitude", "Proximal_Count"]
-    display_cols += [c for c in ALL_METRIC_COLS if c in p.columns]
-    if selected_metric == "High-Grade Score" and "HighGradeScore" in p.columns:
-        display_cols.append("HighGradeScore")
-    if metric_col not in display_cols:
-        display_cols.append(metric_col)
-    if "Classification" in p.columns:
-        display_cols.append("Classification")
-    display_cols = list(dict.fromkeys(c for c in display_cols if c in p.columns))
-
-    rdf = p[p["_passes_filter"]][display_cols].dropna(subset=[metric_col]).copy()
-    if not rdf.empty:
-        rdf["Percentile"] = rdf[metric_col].rank(pct=True, ascending=(not ascending)) * 100
-        rdf = rdf.sort_values(metric_col, ascending=ascending).reset_index(drop=True)
-        rdf.index = rdf.index + 1
-        rdf.index.name = "Rank"
-        rank_df = rdf.rename(columns={"_prospect_type": "Type", "Proximal_Count": "Proximal"})
-
-# ==========================================================
 # Executive summary
 # ==========================================================
 st.title("Bakken Inventory Optimizer")
 
-if n_passing > 0:
-    best_pool = p[p["_passes_filter"]].dropna(subset=[metric_col])
-    if not best_pool.empty:
-        best_row = best_pool.sort_values(metric_col, ascending=ascending).iloc[0]
-        avg_prox = p[p["_passes_filter"]]["Proximal_Count"].mean()
-        best_label = best_row["Label"] if best_row["Label"] else "Unnamed"
-        st.success(
-            f"**{n_passing}** of {n_total} prospects pass filters. "
-            f"Top prospect by **{selected_metric}**: **{best_label}** "
-            f"({metric_col} = {best_row[metric_col]:,.2f}). "
-            f"Avg proximal wells/prospect: **{avg_prox:.1f}**."
-        )
-    else:
-        st.info(f"**{n_passing}** prospects pass filters but none have valid {selected_metric} data.")
-else:
-    st.warning("No prospects pass the current filters. Try relaxing your criteria.")
+st.info(
+    f"**{n_passing}** of {n_total} prospects pass filters "
+    f"({n_passing / max(n_total, 1) * 100:.0f}%). "
+    f"Buffer: {buffer_distance}m."
+)
 
 # ==========================================================
 # MAP
@@ -773,36 +652,40 @@ folium.FeatureGroup(name="Units", show=True).add_child(
     })
 ).add_to(m)
 
-# Buffers
+# Buffers — all translucent black
 buffer_fg = folium.FeatureGroup(name="Prospect Buffers")
+
+BUFFER_STYLE_PASS = {
+    "fillColor": "#000000", "fillOpacity": 0.08,
+    "color": "#000000", "weight": 0.5, "opacity": 0.3,
+}
+BUFFER_STYLE_FAIL = {
+    "fillColor": "#000000", "fillOpacity": 0.04,
+    "color": "#000000", "weight": 0.3, "opacity": 0.15,
+}
+BUFFER_STYLE_NO_PROX = {
+    "fillColor": "#000000", "fillOpacity": 0.04,
+    "color": "#000000", "weight": 0.5, "dashArray": "5 5", "opacity": 0.2,
+}
+
 for _, brow in buffer_gdf[buffer_gdf["_passes_filter"]].iterrows():
-    fc = label_color_map.get(brow["Label"], "#cccccc")
     tip_html = build_tooltip_label(brow)
-    if metric_col in brow.index and pd.notna(brow[metric_col]) and metric_col not in ALL_METRIC_COLS:
-        tip_html += f"<br>{metric_col}: {fmt_val(metric_col, brow[metric_col])}"
     folium.GeoJson(
         brow.geometry.__geo_interface__,
-        style_function=lambda _, _fc=fc: {
-            "fillColor": _fc, "fillOpacity": 0.4, "color": _fc, "weight": 1, "opacity": 0.7
-        },
+        style_function=lambda _: BUFFER_STYLE_PASS,
         tooltip=folium.Tooltip(tip_html, sticky=True, style=TOOLTIP_STYLE),
     ).add_to(buffer_fg)
 
 for _, brow in buffer_gdf[~buffer_gdf["_passes_filter"] & ~buffer_gdf["_no_proximal"]].iterrows():
     folium.GeoJson(
         brow.geometry.__geo_interface__,
-        style_function=lambda _: {
-            "fillColor": "#d3d3d3", "fillOpacity": 0.15, "color": "#aaa", "weight": 0.5, "opacity": 0.3
-        },
+        style_function=lambda _: BUFFER_STYLE_FAIL,
     ).add_to(buffer_fg)
 
 for _, brow in buffer_gdf[buffer_gdf["_no_proximal"]].iterrows():
     folium.GeoJson(
         brow.geometry.__geo_interface__,
-        style_function=lambda _: {
-            "fillColor": "#ffe0b2", "fillOpacity": 0.1, "color": "orange",
-            "weight": 1, "dashArray": "5 5", "opacity": 0.4
-        },
+        style_function=lambda _: BUFFER_STYLE_NO_PROX,
     ).add_to(buffer_fg)
 buffer_fg.add_to(m)
 
@@ -872,7 +755,10 @@ for _, row in p_lines_display.iterrows():
             continue
         val = row[c]
         if pd.notna(val) and str(val).strip():
-            tip_parts.append(f"<b>{c}:</b> {val}")
+            if c == "Label" and str(row.get("_label_is_section", "False")) == "True":
+                tip_parts.append(f"<b>Section:</b> {val}")
+            else:
+                tip_parts.append(f"<b>{c}:</b> {val}")
 
     folium.GeoJson(
         row.geometry.__geo_interface__,
@@ -906,7 +792,6 @@ if classification_ready and "Classification" in p.columns:
     if not pros_chart.empty:
         col1, col2 = st.columns(2)
 
-        # --- UPDATED: x-axis range uses SectionROIP ---
         x_range = np.linspace(
             field[SECTION_ROIP_COL].min(),
             field[SECTION_ROIP_COL].max(),
@@ -922,13 +807,13 @@ if classification_ready and "Classification" in p.columns:
         for y_col, model, target_col in chart_configs:
             with target_col:
                 fig = px.scatter(
-                    pros_chart, x=SECTION_ROIP_COL, y=y_col,  # <-- UPDATED x-axis
+                    pros_chart, x=SECTION_ROIP_COL, y=y_col,
                     color="Classification", color_discrete_map=COLOR_MAP_CLASS,
                     hover_data=["Label"],
                     title=f"{y_col} vs {SECTION_ROIP_COL}",
                 )
                 fig.add_trace(go.Scatter(
-                    x=field[SECTION_ROIP_COL], y=field[y_col],  # <-- UPDATED
+                    x=field[SECTION_ROIP_COL], y=field[y_col],
                     mode="markers", name="Field UWIs",
                     marker=dict(color="lightgrey", size=4, opacity=0.5),
                 ))
@@ -938,7 +823,7 @@ if classification_ready and "Classification" in p.columns:
                 ))
                 st.plotly_chart(fig, use_container_width=True)
 
-        # ---- Productivity vs Resource quadrant chart ----
+        # Productivity vs Resource quadrant chart
         with col2:
             fig_quad = px.scatter(
                 pros_chart, x="Resource_Z", y="Productivity_Z",
@@ -946,7 +831,7 @@ if classification_ready and "Classification" in p.columns:
                 hover_data=["Label"],
                 title="Productivity Z vs Resource Z (4-Quadrant)",
                 labels={
-                    "Resource_Z": f"Resource Z ({SECTION_ROIP_COL})",  # <-- UPDATED label
+                    "Resource_Z": f"Resource Z ({SECTION_ROIP_COL})",
                     "Productivity_Z": "Productivity Z (Composite)",
                 },
             )
@@ -981,8 +866,8 @@ if classification_ready and "Classification" in p.columns:
 
             st.plotly_chart(fig_quad, use_container_width=True)
 
-        # ---- Summary ----
-        st.subheader("Summary")
+        # Summary
+        st.subheader("Classification/Ranking Table")
         summary = pros_chart["Classification"].value_counts().reset_index()
         summary.columns = ["Classification", "Count"]
         quad_order = list(COLOR_MAP_CLASS.keys())
@@ -990,7 +875,6 @@ if classification_ready and "Classification" in p.columns:
         summary = summary.sort_values("Classification").reset_index(drop=True)
         st.dataframe(summary, use_container_width=True)
 
-        # --- UPDATED: include ROIP in classification export ---
         cls_display = pros_chart[[
             "Label", "Latitude", "Longitude",
             SECTION_OOIP_COL, SECTION_ROIP_COL,
@@ -1005,49 +889,6 @@ if classification_ready and "Classification" in p.columns:
         )
     else:
         st.warning("No prospects with complete data for classification charts.")
-
-# ==========================================================
-# RANKING
-# ==========================================================
-st.markdown("---")
-st.header("📊 Prospect Ranking")
-
-if selected_metric == "High-Grade Score" and total_weight != 100:
-    st.warning("Adjust weights to total 100% to see rankings.")
-elif rank_df is None or rank_df.empty:
-    st.warning(f"No valid data for **{selected_metric}**.")
-else:
-    st.caption(
-        f"Ranked by **{selected_metric}** · {len(rank_df)} prospects · "
-        f"Buffer: {buffer_distance}m · IDW² interpolation"
-    )
-    fmt = {}
-    for c in rank_df.columns:
-        if c in ("Label", "Type", "Classification"):
-            continue
-        if c == "Percentile":
-            fmt[c] = "{:.0f}%"
-        elif c == "Proximal":
-            fmt[c] = "{:.0f}"
-        elif c in ("Latitude", "Longitude"):
-            fmt[c] = "{:.6f}"
-        elif rank_df[c].dtype in [np.float64, np.float32, float]:
-            fmt[c] = (
-                "{:,.0f}" if pd.notna(rank_df[c].abs().max()) and rank_df[c].abs().max() > 100
-                else "{:.3f}"
-            )
-
-    styled = rank_df.style.background_gradient(
-        subset=[metric_col], cmap="YlGn",
-        gmap=rank_df[metric_col] if not ascending else -rank_df[metric_col],
-    ).background_gradient(subset=["Percentile"], cmap="RdYlGn").format(fmt)
-
-    st.dataframe(styled, use_container_width=True, height=500)
-    st.download_button(
-        "⬇️ Download Rankings (CSV)",
-        data=rank_df.to_csv().encode("utf-8"),
-        file_name="bakken_prospect_rankings.csv", mime="text/csv",
-    )
 
 # No-proximal table
 no_prox = p[p["_no_proximal"]]
