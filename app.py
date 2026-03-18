@@ -452,7 +452,7 @@ def analyze_prospects(_pros, _prox, _sections, buffer_m):
 prospect_metrics = analyze_prospects(prospects, proximal_wells, section_enriched, buffer_distance)
 
 for c in prospect_metrics.columns:
-    prospects[c] = prospect_metrics[c].values
+    prospects[c] = prospect_metrics[c]
 
 for col in ALL_METRIC_COLS:
     if col in prospects.columns:
