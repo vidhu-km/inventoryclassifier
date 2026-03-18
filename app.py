@@ -18,7 +18,7 @@ import string
 # ==========================================================
 # Page configuration & Constants
 # ==========================================================
-st.set_page_config(layout="wide", page_title="Bakken Inventory Optimizer", page_icon="🛢️")
+st.set_page_config(layout="wide", page_title="Bakken Inventory Classifier", page_icon="🛢️")
 
 NULL_STYLE = {"fillColor": "#ffffff", "fillOpacity": 0, "color": "#888", "weight": 0.25}
 DEFAULT_BUFFER_M = 900
@@ -616,7 +616,7 @@ p_lines_display = p_lines.to_crs(4326)
 # ==========================================================
 # Executive summary
 # ==========================================================
-st.title("Bakken Inventory Classifier")
+st.title("🛢️ Bakken Inventory Classifier")
 
 st.info(
     f"**{n_passing}** of {n_total} prospects pass filters "
