@@ -616,7 +616,7 @@ p_lines_display = p_lines.to_crs(4326)
 # ==========================================================
 # Executive summary
 # ==========================================================
-st.title("Bakken Inventory Optimizer")
+st.title("Bakken Inventory Classifier")
 
 st.info(
     f"**{n_passing}** of {n_total} prospects pass filters "
