@@ -888,49 +888,6 @@ if map_result and map_result.get("all_drawings"):
                     })
                     new_drawings_found = True
 
-# Show drawn wells management
-if st.session_state.drawn_wells:
-    col_draw_header, col_draw_clear = st.columns([4, 1])
-    with col_draw_header:
-        st.subheader(f"✏️ Custom Drawn Wells ({len(st.session_state.drawn_wells)})")
-        st.caption(
-            "Draw a line on the map using the polyline tool (left sidebar of map). "
-            "Only the first and last vertices are kept as the heel and toe endpoints. "
-            "Click **Classify** to re-run analysis with your custom wells."
-        )
-    with col_draw_clear:
-        if st.button("🗑️ Clear All", key="clear_drawn"):
-            st.session_state.drawn_wells = []
-            st.rerun()
-
-    # Editable table of drawn wells
-    for i, dw in enumerate(st.session_state.drawn_wells):
-        c1, c2, c3, c4 = st.columns([2, 3, 3, 1])
-        with c1:
-            new_label = st.text_input(
-                "Label", value=dw.get("label") or f"Custom-{i+1}",
-                key=f"dw_label_{i}", label_visibility="collapsed",
-            )
-            st.session_state.drawn_wells[i]["label"] = new_label
-        with c2:
-            lon1, lat1 = dw["coords"][0]
-            st.caption(f"Heel: {lat1:.5f}, {lon1:.5f}")
-        with c3:
-            lon2, lat2 = dw["coords"][-1]
-            st.caption(f"Toe: {lat2:.5f}, {lon2:.5f}")
-        with c4:
-            if st.button("❌", key=f"del_dw_{i}"):
-                st.session_state.drawn_wells.pop(i)
-                st.rerun()
-
-    if new_drawings_found or st.button("🔄 Classify Custom Wells", type="primary"):
-        st.rerun()
-
-elif not st.session_state.drawn_wells:
-    st.caption(
-        "✏️ **Draw a well on the map** using the polyline tool on the left side of the map. "
-        "It will appear here for labelling and classification."
-    )
 
 # ==========================================================
 # Custom Well Results Card
